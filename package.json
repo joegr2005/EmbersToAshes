@@ -1,0 +1,11 @@
+{
+  "name": "embers-to-ash",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static mirror of emberstoash.com",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scripts/scrape.mjs",
+    "dev": "vercel dev"
+  }
+}

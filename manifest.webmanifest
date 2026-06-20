@@ -1,0 +1,21 @@
+{
+  "scope": "/",
+  "start_url": "/",
+  "display": "standalone",
+  "icons": [
+    {
+      "sizes": "192x192",
+      "type": "image/png",
+      "src": "/assets/img/icon.jpg"
+    },
+    {
+      "sizes": "512x512",
+      "type": "image/png",
+      "src": "/assets/img/icon.jpg"
+    }
+  ],
+  "name": "Embers to Ash",
+  "short_name": "Embers to Ash",
+  "theme_color": "#d1bebe",
+  "background_color": "#d1bebe"
+}

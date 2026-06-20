@@ -1,0 +1,13 @@
+# Local scrape cache (raw downloaded HTML used during research)
+.scrape-research/
+
+# Dependencies
+node_modules/
+
+# Vercel
+.vercel/
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.log
