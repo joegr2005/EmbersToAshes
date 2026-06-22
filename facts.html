@@ -214,8 +214,14 @@ SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
 
 <script>(function(){
   function q(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
-  // Open the navigation drawer. The hamburger shows only on narrow screens and
-  // the inline links show on desktop, both via the original responsive CSS.
+  // Reveal the inline desktop nav links: the builder hides each .nav-item with
+  // visibility:hidden and used its (removed) runtime to show them. Reveal the
+  // first nav group and hide the duplicate group (the one with the "More" menu).
+  q('nav[data-aid="HEADER_NAV_RENDERED"]').forEach(function(n,i){
+    if(i===0){ q('.nav-item',n).forEach(function(it){ it.style.visibility='visible'; }); }
+    else { var cell=n.closest('[data-ux="GridCell"]')||n; cell.style.display='none'; }
+  });
+  // Open the navigation drawer (the hamburger shows only on narrow screens).
   q('a[toggleId]').forEach(function(btn){
     btn.addEventListener('click', function(e){
       e.preventDefault();
