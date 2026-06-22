@@ -5,7 +5,6 @@
   "description": "Static mirror of emberstoash.com",
   "type": "module",
   "scripts": {
-    "scrape": "node scripts/scrape.mjs",
-    "dev": "vercel dev"
+    "scrape": "node scripts/scrape.mjs"
   }
 }

@@ -4,13 +4,12 @@
 //
 // What it does:
 //   1. Fetches each page's server-rendered HTML.
-//   2. Downloads every referenced font (Google fonts via GoDaddy CDN) and
-//      every image (GoDaddy "isteam"/getty CDN) one time each.
+//   2. Downloads every referenced font and image from the source CDN once.
 //   3. Rewrites all CDN URLs to local /assets/... paths.
-//   4. Strips GoDaddy runtime JS + the service-worker registration so the
-//      copy renders identically offline with no external calls.
-//   5. Injects a tiny script to keep the mobile nav drawer, "More" dropdown
-//      and cookie banner interactive.
+//   4. Strips the builder's runtime JS + the service-worker registration so
+//      the copy renders identically offline with no external calls.
+//   5. Applies content corrections and injects a tiny script that drives the
+//      hamburger navigation and "More" dropdown.
 //   6. Emits <route>.html (+ index.html), manifest.webmanifest and vercel.json.
 //
 // Run from the project root:  node scripts/scrape.mjs
@@ -70,11 +69,12 @@ function reEsc(s) {
 }
 
 // Small runtime injected into every page to preserve interactivity that the
-// (removed) GoDaddy bundle used to provide.
+// (removed) builder bundle used to provide.
 const CUSTOM_JS = `
 (function(){
   function q(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
-  // Open mobile navigation drawer
+  // Open the navigation drawer. The hamburger shows only on narrow screens and
+  // the inline links show on desktop, both via the original responsive CSS.
   q('a[toggleId]').forEach(function(btn){
     btn.addEventListener('click', function(e){
       e.preventDefault();
@@ -97,21 +97,17 @@ const CUSTOM_JS = `
       if(menu){ menu.style.display=(menu.style.display==='block'?'none':'block'); }
     });
   });
-  // Reveal + dismiss cookie banner
-  var banner=document.querySelector('[id$="-banner"]');
-  if(banner){
-    setTimeout(function(){ banner.style.bottom='24px'; }, 500);
-    var acc=document.querySelector('[id$="-accept"]');
-    if(acc){ acc.addEventListener('click', function(e){ e.preventDefault(); banner.style.display='none'; }); }
-  }
   // Static mirror: prevent dead form submissions from reloading the page
   q('form').forEach(function(f){ f.addEventListener('submit', function(e){ e.preventDefault(); }); });
 })();
 `.trim();
 
+// Quality gate: generated pages must not contain un-localized source CDN URLs.
+const forbidden = /wsimg\.com/i;
+
 // ---- Requested content corrections ------------------------------------------
 
-// Footer: replace GoDaddy's "Powered by Airo" with our own links.
+// Footer: replace the builder's "Powered by" block with our own links.
 // - Privacy Policy -> local /privacy-policy page
 // - Built by Gravish Digital -> dofollow backlink to gravishdigital.com
 const FOOTER_LINKS =
@@ -123,9 +119,9 @@ const FOOTER_LINKS =
 function customizeFooter(html) {
   // (1b) bump the copyright year
   html = html.replace(/(Copyright\s*(?:&copy;|\u00a9)\s*)2025/g, '$1' + '2026');
-  // (1a + 1c + 1d) swap "Powered by Airo" for Privacy Policy + Built by Gravish Digital
+  // (1a + 1c + 1d) swap the "Powered by" block for Privacy Policy + Built by Gravish Digital
   html = html.replace(
-    /<p data-ux="FooterDetails" data-aid="FOOTER_POWERED_BY_AIRO_RENDERED"[\s\S]*?<\/a>/,
+    /<p data-ux="FooterDetails"[^>]*>\s*<span>Powered by\s*<\/span>\s*<\/p>\s*<a\b[^>]*>[\s\S]*?<\/a>/,
     FOOTER_LINKS
   );
   return html;
@@ -142,6 +138,47 @@ function customizeContact(html) {
     /<div data-ux="Block"[^>]*>\s*<label data-ux="InputCheckbox" data-aid="CONTACT_FORM_EMAIL_OPT_IN"[\s\S]*?<\/label>\s*<\/div>/g,
     ''
   );
+  return html;
+}
+
+function customizeHero(html) {
+  // (3) homepage hero: show "~ Purely Intentional Products ~" centered over the
+  // main image, reusing the original Tagline <h1> (and its scaler spans).
+  html = html.replace(/>Launching Soon/g, '>~ Purely Intentional Products ~');
+  // remove the now-duplicate sub-tagline line
+  html = html.replace(/<div data-ux="SubTagline"[\s\S]*?<\/div>/, '');
+  return html;
+}
+
+// (1, 4, 5) Strip builder-specific artifacts and dead markup: the cookie
+// pop-up + empty messaging/popup widgets, the generator meta, the free-tier
+// ad placeholder, and dead click-tracking (data-tccl) attributes.
+function removeBuilderArtifacts(html) {
+  html = html.replace(/<meta name="generator"[^>]*>/g, '');
+  html = html.replace(/<div id="freemium-ad-[^"]*"><\/div>/g, '');
+  html = html.replace(/\s*data-tccl="[^"]*"/g, '');
+  // remove inert hidden "scaler" spans (the builder's font-sizing runtime is
+  // gone) and dead editor hooks
+  html = html.replace(/<span[^>]*data-ux="scaler"[^>]*>[\s\S]*?<\/span>/g, '');
+  html = html.replace(/\s*data-edit-interactive="[^"]*"/g, '');
+  // normalize the stale pre-launch social-card description site-wide
+  html = html.replace(
+    /(<meta name="twitter:description" content=")Launching Soon\s*(")/g,
+    '$1~Purely Intentional Products~$2'
+  );
+  // The messaging, cookie-banner and popup widgets sit contiguously at the end
+  // of the page body; remove the whole block in one cut.
+  const s = html.indexOf('<div id="0880055d-06ce-48b3-835c-40ea8d0dbfe5"');
+  const e = html.indexOf('<div id="dd84bc14-4e97-416d-b985-9a98a3ab69a1"');
+  if (s !== -1 && e !== -1) {
+    const popupEnd = html.indexOf('</div>', e) + '</div>'.length;
+    html = html.slice(0, s) + html.slice(popupEnd);
+  } else {
+    html = html.replace(
+      /<div id="[0-9a-f-]+" class="widget widget-cookie-banner[\s\S]*?<\/div><\/div>/,
+      ''
+    );
+  }
   return html;
 }
 
@@ -264,17 +301,23 @@ async function main() {
     }
 
     // Apply the requested content corrections (footer on every page; the
-    // contact-form removals only match on the welcome page).
+    // contact-form + hero changes apply to the home page only).
     html = customizeFooter(html);
     html = customizeContact(html);
+    if (p.home) html = customizeHero(html);
 
-    // Remove GoDaddy runtime scripts + service-worker registration.
+    // Remove builder artifacts: cookie pop-up, empty/ad widgets, generator
+    // meta, and dead tracking attributes.
+    html = removeBuilderArtifacts(html);
+
+    // Remove the builder's runtime scripts + service-worker registration.
     html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
     html = html.replace(/<script\b[^>]*\/>/gi, '');
 
-    // Inject our small interactivity shim.
+    // Inject our interactivity shim.
     html = html.replace('</body>', `<script>${CUSTOM_JS}</script></body>`);
 
+    if (forbidden.test(html)) console.warn('WARN: residual builder reference in', p.route + '.html');
     if (p.home) welcomeProcessed = html;
 
     await writeFile(path.join(OUT, `${p.route}.html`), html, 'utf8');
@@ -291,6 +334,7 @@ async function main() {
       let pp =
         welcomeProcessed.slice(0, cStart) + PRIVACY_CONTENT + welcomeProcessed.slice(fStart);
       pp = pp.replace('<title>Welcome</title>', '<title>Privacy Policy | Embers to Ash</title>');
+      if (forbidden.test(pp)) console.warn('WARN: residual builder reference in privacy-policy.html');
       await writeFile(path.join(OUT, 'privacy-policy.html'), pp, 'utf8');
       console.log('wrote  privacy-policy.html');
     } else {
