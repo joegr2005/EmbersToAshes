@@ -369,7 +369,6 @@ const PRIVACY_STYLE = `<style>
 
 const PRIVACY_BODY = `
 <h1>Privacy Policy</h1>
-<p class="updated">Last updated: June 22, 2026</p>
 <p>At Embers to Ash ("we," "us," or "our"), your privacy matters to us. This Privacy Policy explains what information we collect, how we use it, and the choices you have when you visit emberstoash.com (the "Site") or contact us.</p>
 <h2>Information We Collect</h2>
 <p>We collect only the information you provide directly to us, such as your name, email address, and any message you submit through our contact form.</p>
