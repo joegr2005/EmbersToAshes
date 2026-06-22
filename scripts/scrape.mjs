@@ -70,6 +70,74 @@ function reEsc(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ---- Minimal element helpers ------------------------------------------------
+// Replace hand-rolled string-index math: given a stable `anchor` (a unique
+// substring of an element's opening tag) these remove or replace that whole
+// element, correctly handling nesting of same-name tags.
+
+// Byte range [start, end) of the element whose opening tag starts at `open`.
+function elementRange(html, open) {
+  if (open === -1) return null;
+  const name = (html.slice(open + 1).match(/^[a-zA-Z0-9]+/) || [])[0];
+  if (!name) return null;
+  const token = new RegExp('<' + name + '\\b|</' + name + '>', 'g');
+  token.lastIndex = html.indexOf('>', open) + 1;
+  let depth = 1;
+  let m;
+  while ((m = token.exec(html))) {
+    if (m[0][1] === '/') {
+      if (--depth === 0) return [open, m.index + m[0].length];
+    } else depth++;
+  }
+  return null;
+}
+
+// Index of the '<' that opens the element whose tag contains `anchor`.
+function tagStart(html, anchor, from = 0) {
+  const at = html.indexOf(anchor, from);
+  return at === -1 ? -1 : html.lastIndexOf('<', at);
+}
+
+function removeElementAt(html, open) {
+  const range = elementRange(html, open);
+  return range ? html.slice(0, range[0]) + html.slice(range[1]) : html;
+}
+
+function removeElement(html, anchor, from = 0) {
+  return removeElementAt(html, tagStart(html, anchor, from));
+}
+
+function replaceElement(html, anchor, replacement, from = 0) {
+  const open = tagStart(html, anchor, from);
+  const range = elementRange(html, open);
+  return range ? html.slice(0, range[0]) + replacement + html.slice(range[1]) : html;
+}
+
+// Remove an inert wrapper (keep its children) by stripping its opening tag and
+// matching closing tag.
+function unwrapElementAt(html, open) {
+  if (open === -1) return html;
+  const name = (html.slice(open + 1).match(/^[a-zA-Z0-9]+/) || [])[0];
+  const range = elementRange(html, open);
+  if (!name || !range) return html;
+  const innerStart = html.indexOf('>', open) + 1;
+  const innerEnd = range[1] - ('</' + name + '>').length;
+  return html.slice(0, range[0]) + html.slice(innerStart, innerEnd) + html.slice(range[1]);
+}
+
+// Flatten the builder's content "widget" wrappers. No CSS targets .widget*, so
+// they only add a dead nesting level + leftover ids; keep their contents.
+function unwrapWidgets(html) {
+  let open;
+  let guard = 0;
+  while ((open = tagStart(html, 'class="widget widget-')) !== -1 && guard++ < 50) {
+    const next = unwrapElementAt(html, open);
+    if (next === html) break;
+    html = next;
+  }
+  return html;
+}
+
 // Small runtime injected into every page to preserve interactivity that the
 // (removed) builder bundle used to provide.
 const CUSTOM_JS = `
@@ -160,18 +228,10 @@ function removeBuilderArtifacts(html) {
     /(<meta name="twitter:description" content=")Launching Soon\s*(")/g,
     '$1~Purely Intentional Products~$2'
   );
-  // The messaging, cookie-banner and popup widgets sit contiguously at the end
-  // of the page body; remove the whole block in one cut.
-  const s = html.indexOf('<div id="0880055d-06ce-48b3-835c-40ea8d0dbfe5"');
-  const e = html.indexOf('<div id="dd84bc14-4e97-416d-b985-9a98a3ab69a1"');
-  if (s !== -1 && e !== -1) {
-    const popupEnd = html.indexOf('</div>', e) + '</div>'.length;
-    html = html.slice(0, s) + html.slice(popupEnd);
-  } else {
-    html = html.replace(
-      /<div id="[0-9a-f-]+" class="widget widget-cookie-banner[\s\S]*?<\/div><\/div>/,
-      ''
-    );
+  // Remove the cookie pop-up and the empty messaging/popup widgets, each found
+  // by its stable widget class (no hardcoded ids or index math).
+  for (const widget of ['widget-messaging', 'widget-cookie-banner', 'widget-popup']) {
+    html = removeElement(html, 'class="widget ' + widget);
   }
   return html;
 }
@@ -202,19 +262,14 @@ function customizeNav(html) {
   html = html.replace(/class="([^"]*\bnav-item\b[^"]*)"/g, function (_, cls) {
     return 'class="' + cls.replace(/\s*\bc1-2m\b/, '') + '"';
   });
-  const tag = 'data-aid="HEADER_NAV_RENDERED"';
-  const first = html.indexOf(tag);
-  if (first !== -1) {
-    const second = html.indexOf(tag, first + tag.length);
-    if (second !== -1) {
-      const navStart = html.lastIndexOf('<nav', second);
-      const cellStart = html.lastIndexOf('<div data-ux="GridCell"', navStart);
-      const navEnd = html.indexOf('</nav>', navStart);
-      if (cellStart !== -1 && navEnd !== -1) {
-        const cellEnd = html.indexOf('</div>', navEnd) + '</div>'.length;
-        html = html.slice(0, cellStart) + html.slice(cellEnd);
-      }
-    }
+  // Delete the duplicate second nav group by removing the grid cell that wraps
+  // it (the first group stays). The empty cell is invisible and keeps the logo
+  // centered as before.
+  const navAnchor = 'data-aid="HEADER_NAV_RENDERED"';
+  const first = html.indexOf(navAnchor);
+  const second = first === -1 ? -1 : html.indexOf(navAnchor, first + navAnchor.length);
+  if (second !== -1) {
+    html = removeElementAt(html, html.lastIndexOf('<div data-ux="GridCell"', second));
   }
   return html;
 }
@@ -267,7 +322,7 @@ const PRIVACY_BODY = `
 <p class="updated">Last updated: June 22, 2026</p>
 <p>At Embers to Ash ("we," "us," or "our"), your privacy matters to us. This Privacy Policy explains what information we collect, how we use it, and the choices you have when you visit emberstoash.com (the "Site") or contact us.</p>
 <h2>Information We Collect</h2>
-<p>We collect information you provide directly to us, such as your name, email address, and any message you submit through our contact form. We also automatically collect limited technical information\u2014such as your browser type, device, and pages visited\u2014through cookies and similar technologies.</p>
+<p>We collect only the information you provide directly to us, such as your name, email address, and any message you submit through our contact form.</p>
 <h2>How We Use Your Information</h2>
 <ul>
 <li>To respond to your inquiries and provide customer support.</li>
@@ -275,8 +330,6 @@ const PRIVACY_BODY = `
 <li>To operate, maintain, and improve the Site and our products.</li>
 <li>To protect against fraud and keep the Site secure.</li>
 </ul>
-<h2>Cookies and Tracking Technologies</h2>
-<p>We use cookies to analyze website traffic and optimize your experience. You can control cookies through your browser settings. Disabling cookies may affect how parts of the Site function.</p>
 <h2>How We Share Your Information</h2>
 <p>We do not sell your personal information. We may share information with trusted service providers who help us operate the Site (for example, hosting and analytics providers), and where required by law or to protect our rights.</p>
 <h2>Data Security</h2>
@@ -394,15 +447,14 @@ async function main() {
   // 4b) Privacy Policy page: reuse the welcome page's header + corrected footer,
   // swapping the contact widget for the privacy content.
   if (welcomeProcessed) {
-    const cStart = welcomeProcessed.indexOf('<div id="9348b19c-e100-4b57-87f3-917139bec823"');
-    const fStart = welcomeProcessed.indexOf('<div id="73419053-1186-44c0-948d-11d982a8b886"');
-    if (cStart !== -1 && fStart !== -1) {
-      let pp =
-        welcomeProcessed.slice(0, cStart) + PRIVACY_CONTENT + welcomeProcessed.slice(fStart);
-      pp = pp.replace('<title>Welcome</title>', '<title>Privacy Policy | Embers to Ash</title>');
+    // Build the privacy page by swapping the contact widget for the privacy
+    // content; the header and footer are reused unchanged.
+    const pp = replaceElement(welcomeProcessed, 'class="widget widget-contact', PRIVACY_CONTENT)
+      .replace('<title>Welcome</title>', '<title>Privacy Policy | Embers to Ash</title>');
+    if (pp !== welcomeProcessed) {
       built.push({ route: 'privacy-policy', home: false, html: pp });
     } else {
-      console.warn('WARN: could not locate content/footer anchors for privacy page');
+      console.warn('WARN: could not locate the contact widget for the privacy page');
     }
   }
 
@@ -438,7 +490,8 @@ async function main() {
 
   // 4d) Replace each page's inline styles with a single cached stylesheet link.
   for (const b of built) {
-    let html = b.html.replace(/<style[^>]*>[\s\S]*?<\/style>/g, '');
+    let html = unwrapWidgets(b.html);
+    html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/g, '');
     html = html.replace('</head>', '<link rel="stylesheet" href="/assets/site.css"/></head>');
     if (forbidden.test(html)) console.warn('WARN: residual builder reference in', b.route + '.html');
     await writeFile(path.join(OUT, `${b.route}.html`), html, 'utf8');
