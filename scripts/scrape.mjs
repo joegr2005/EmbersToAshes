@@ -181,14 +181,24 @@ const remoteAsset = /(?:url\(\s*["']?|\bsrc="\s*|\bsrcset="\s*)(?:https?:)?\/\//
 
 // ---- Requested content corrections ------------------------------------------
 
-// Footer: replace the builder's "Powered by" block with our own links.
-// - Privacy Policy -> local /privacy-policy page
-// - Built by Gravish Digital -> dofollow backlink to gravishdigital.com
+// Footer: replace the builder's "Powered by" block with our own links
+// (Privacy Policy + dofollow Built by Gravish Digital backlink). Styled with
+// page-independent classes + a small injected stylesheet, because the builder's
+// atomic class numbers differ per page; this keeps the footer identical on
+// every page.
+const FOOTER_STYLE =
+  '.widget-footer [data-aid="FOOTER_COPYRIGHT_RENDERED"]{color:rgb(145,145,145)}' +
+  '.eta-fnav{margin:24px 0 0;font-size:14px;line-height:1.5}' +
+  '.eta-fnav a{color:rgb(209,190,190);text-decoration:none}' +
+  '.eta-fnav a:hover{color:rgb(212,194,194)}' +
+  '.eta-fsep{padding:0 8px;color:rgb(145,145,145)}' +
+  '@media (min-width:1024px){.eta-fnav{margin-top:0;text-align:right}}';
+
 const FOOTER_LINKS =
-  '<p data-ux="FooterDetails" data-typography="BodyAlpha" class="x-el x-el-p c1-1 c1-2 c1-1f c1-1g c1-4k c1-ar c1-au c1-74 c1-b c1-ap c1-c c1-2e c1-d c1-as c1-at c1-e c1-f c1-g">' +
-  '<a rel="noopener" role="link" data-ux="Link" href="/privacy-policy" data-typography="LinkAlpha" class="x-el x-el-a c1-1c c1-1d c1-1e c1-1f c1-1g c1-25 c1-1h c1-b c1-av c1-c c1-1o c1-52 c1-aw c1-d c1-e c1-f c1-g">Privacy Policy</a>' +
-  '<span style="padding:0 8px;color:rgb(145,145,145)">\u00b7</span>' +
-  '<a rel="noopener" role="link" target="_blank" data-ux="Link" title="Gravish Digital" href="https://www.gravishdigital.com" data-typography="LinkAlpha" class="x-el x-el-a c1-1c c1-1d c1-1e c1-1f c1-1g c1-25 c1-1h c1-b c1-av c1-c c1-1o c1-52 c1-aw c1-d c1-e c1-f c1-g">Built by Gravish Digital</a></p>';
+  '<p class="eta-fnav">' +
+  '<a rel="noopener" role="link" data-ux="Link" href="/privacy-policy">Privacy Policy</a>' +
+  '<span class="eta-fsep">\u00b7</span>' +
+  '<a rel="noopener" role="link" target="_blank" data-ux="Link" title="Gravish Digital" href="https://www.gravishdigital.com">Built by Gravish Digital</a></p>';
 
 function customizeFooter(html) {
   // (1b) bump the copyright year
@@ -490,6 +500,10 @@ async function main() {
     html = customizeNav(html);
     html = cleanHead(html);
     html = stripInertAttrs(html);
+
+    // Inject the consistent footer styling (page-independent of the builder's
+    // per-page atomic class numbering).
+    html = html.replace('</head>', '<style>' + FOOTER_STYLE + '</style></head>');
 
     // Remove the builder's runtime scripts + service-worker registration.
     html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
