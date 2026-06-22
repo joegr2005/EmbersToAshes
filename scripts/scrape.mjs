@@ -7,9 +7,9 @@
 //   2. Downloads every referenced font and image (host-agnostic) once.
 //   3. Rewrites those asset URLs to local /assets/... paths.
 //   4. Strips the builder's runtime JS + the service-worker registration.
-//   5. Optimizes builder cruft: consolidates inline CSS into one cached
-//      stylesheet, makes the desktop nav work without JS, and cleans the head.
-//   6. Emits <route>.html (+ index.html), assets/site.css, manifest + vercel.json.
+//   5. Reproduces the original split header without JS, de-lazifies images, and
+//      cleans the head; each page keeps its own inline CSS for exact fidelity.
+//   6. Emits <route>.html (+ index.html), manifest.webmanifest and vercel.json.
 //
 // Run from the project root:  node scripts/scrape.mjs
 //
@@ -138,29 +138,15 @@ function replaceElement(html, anchor, replacement, from = 0) {
   return range ? html.slice(0, range[0]) + replacement + html.slice(range[1]) : html;
 }
 
-// Remove an inert wrapper (keep its children) by stripping its opening tag and
-// matching closing tag.
-function unwrapElementAt(html, open) {
-  if (open === -1) return html;
-  const name = (html.slice(open + 1).match(/^[a-zA-Z0-9]+/) || [])[0];
+// Replace just the children of the element whose opening tag contains `anchor`.
+function replaceInner(html, anchor, inner, from = 0) {
+  const open = tagStart(html, anchor, from);
   const range = elementRange(html, open);
-  if (!name || !range) return html;
+  if (open === -1 || !range) return html;
+  const name = (html.slice(open + 1).match(/^[a-zA-Z0-9]+/) || [])[0];
   const innerStart = html.indexOf('>', open) + 1;
   const innerEnd = range[1] - ('</' + name + '>').length;
-  return html.slice(0, range[0]) + html.slice(innerStart, innerEnd) + html.slice(range[1]);
-}
-
-// Flatten the builder's content "widget" wrappers. No CSS targets .widget*, so
-// they only add a dead nesting level + leftover ids; keep their contents.
-function unwrapWidgets(html) {
-  let open;
-  let guard = 0;
-  while ((open = tagStart(html, 'class="widget widget-')) !== -1 && guard++ < 50) {
-    const next = unwrapElementAt(html, open);
-    if (next === html) break;
-    html = next;
-  }
-  return html;
+  return html.slice(0, innerStart) + inner + html.slice(innerEnd);
 }
 
 // Small runtime injected into every page to preserve interactivity that the
@@ -299,41 +285,25 @@ function removeBuilderArtifacts(html) {
   return html;
 }
 
-// ---- Item 1 helper: split CSS into top-level rules (brace-aware) ----
-function splitCssRules(css) {
-  const rules = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < css.length; i++) {
-    const ch = css[i];
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        rules.push(css.slice(start, i + 1).trim());
-        start = i + 1;
-      }
-    }
-  }
-  return rules.filter(Boolean);
-}
-
-// (2) Make the desktop nav work without JS: drop visibility:hidden (c1-2m) from
-// the nav items, and delete the duplicate second nav group (the one with the
-// "More" overflow). The hamburger drawer still drives narrow screens.
+// (5) Reproduce the original split header without the builder's JS: the first
+// two links sit left of the centered logo, the last two to the right. The
+// builder ships two desktop nav groups; the first lists all four links in
+// order. Reveal the items (drop visibility:hidden) and place the first two in
+// the left group and the last two in the right group; the mobile drawer keeps
+// all four.
 function customizeNav(html) {
-  html = html.replace(/class="([^"]*\bnav-item\b[^"]*)"/g, function (_, cls) {
-    return 'class="' + cls.replace(/\s*\bc1-2m\b/, '') + '"';
-  });
-  // Delete the duplicate second nav group by removing the grid cell that wraps
-  // it (the first group stays). The empty cell is invisible and keeps the logo
-  // centered as before.
-  const navAnchor = 'data-aid="HEADER_NAV_RENDERED"';
-  const first = html.indexOf(navAnchor);
-  const second = first === -1 ? -1 : html.indexOf(navAnchor, first + navAnchor.length);
-  if (second !== -1) {
-    html = removeElementAt(html, html.lastIndexOf('<div data-ux="GridCell"', second));
-  }
+  const navOpen = tagStart(html, 'data-aid="HEADER_NAV_RENDERED"');
+  if (navOpen === -1) return html;
+  const navRange = elementRange(html, navOpen);
+  if (!navRange) return html;
+  const items = [
+    ...html.slice(navRange[0], navRange[1]).matchAll(
+      /<div data-ux="Block" class="[^"]*\bnav-item\b[^"]*"[\s\S]*?<\/a><\/div>/g
+    ),
+  ].map((m) => m[0].replace(/\s*\bc1-2m\b/, ''));
+  if (items.length < 4) return html;
+  html = replaceInner(html, 'navId-1"', items[0] + items[1]);
+  html = replaceInner(html, 'navId-2"', items[2] + items[3]);
   return html;
 }
 
@@ -492,7 +462,7 @@ async function main() {
     console.log('image ', name, got.buf.length + 'b');
   }
 
-  // 4) Transform each page (styles stay inline here; consolidated in 4c).
+  // 4) Transform each page (each keeps its own inline CSS).
   const built = [];
   let welcomeProcessed = null;
   for (const p of pages) {
@@ -546,45 +516,12 @@ async function main() {
     }
   }
 
-  // 4c) Item 1: consolidate every page's inline <style> into one cached
-  // /assets/site.css. Class names + fonts are identical across pages, so the
-  // union is safe; rules are de-duplicated and grouped by their original sheet.
-  const sheetOrder = [];
-  const sheets = new Map();
+  // 4c) Write each page, keeping its own inline CSS so the cascade matches the
+  // original exactly (fidelity over the shared-stylesheet optimization).
   for (const b of built) {
-    const re = /<style([^>]*)>([\s\S]*?)<\/style>/g;
-    let m;
-    while ((m = re.exec(b.html))) {
-      const key = (m[1] || '').trim();
-      const css = (m[2] || '').replace(/\/\*[\s\S]*?\*\//g, '');
-      if (!sheets.has(key)) {
-        sheets.set(key, { seen: new Set(), rules: [] });
-        sheetOrder.push(key);
-      }
-      const g = sheets.get(key);
-      for (const r of splitCssRules(css)) {
-        if (!g.seen.has(r)) {
-          g.seen.add(r);
-          g.rules.push(r);
-        }
-      }
-    }
-  }
-  let siteCss =
-    '/* Embers to Ash - consolidated styles. Fonts: Dancing Script, Cantarell, Cinzel (SIL OFL). */\n';
-  for (const key of sheetOrder) siteCss += sheets.get(key).rules.join('') + '\n';
-  if (remoteAsset.test(siteCss)) console.warn('WARN: un-localized remote asset in site.css');
-  await writeFile(path.join(ASSET_DIR, 'site.css'), siteCss, 'utf8');
-  console.log('wrote  assets/site.css ' + Math.round(Buffer.byteLength(siteCss) / 1024) + 'KB');
-
-  // 4d) Replace each page's inline styles with a single cached stylesheet link.
-  for (const b of built) {
-    let html = unwrapWidgets(b.html);
-    html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/g, '');
-    html = html.replace('</head>', '<link rel="stylesheet" href="/assets/site.css"/></head>');
-    if (remoteAsset.test(html)) console.warn('WARN: un-localized remote asset in', b.route + '.html');
-    await writeFile(path.join(OUT, `${b.route}.html`), html, 'utf8');
-    if (b.home) await writeFile(path.join(OUT, 'index.html'), html, 'utf8');
+    if (remoteAsset.test(b.html)) console.warn('WARN: un-localized remote asset in', b.route + '.html');
+    await writeFile(path.join(OUT, `${b.route}.html`), b.html, 'utf8');
+    if (b.home) await writeFile(path.join(OUT, 'index.html'), b.html, 'utf8');
     console.log('wrote ', b.route + '.html' + (b.home ? ' (+ index.html)' : ''));
   }
 
