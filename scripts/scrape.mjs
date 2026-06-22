@@ -6,11 +6,10 @@
 //   1. Fetches each page's server-rendered HTML.
 //   2. Downloads every referenced font and image from the source CDN once.
 //   3. Rewrites all CDN URLs to local /assets/... paths.
-//   4. Strips the builder's runtime JS + the service-worker registration so
-//      the copy renders identically offline with no external calls.
-//   5. Applies content corrections and injects a tiny script that drives the
-//      hamburger navigation and "More" dropdown.
-//   6. Emits <route>.html (+ index.html), manifest.webmanifest and vercel.json.
+//   4. Strips the builder's runtime JS + the service-worker registration.
+//   5. Optimizes builder cruft: consolidates inline CSS into one cached
+//      stylesheet, makes the desktop nav work without JS, and cleans the head.
+//   6. Emits <route>.html (+ index.html), assets/site.css, manifest + vercel.json.
 //
 // Run from the project root:  node scripts/scrape.mjs
 //
@@ -28,6 +27,9 @@ const FONT_DIR = path.join(ASSET_DIR, 'fonts');
 const IMG_DIR = path.join(ASSET_DIR, 'img');
 
 const ORIGIN = 'https://emberstoash.com';
+// Canonical URL of the deployed copy (used for og:/twitter: tags). Update this
+// if you map a custom domain.
+const SITE_URL = 'https://emberstoashes.vercel.app';
 const PAGES = [
   { route: 'welcome', home: true },
   { route: 'get-to-know-us' },
@@ -73,14 +75,8 @@ function reEsc(s) {
 const CUSTOM_JS = `
 (function(){
   function q(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
-  // Reveal the inline desktop nav links: the builder hides each .nav-item with
-  // visibility:hidden and used its (removed) runtime to show them. Reveal the
-  // first nav group and hide the duplicate group (the one with the "More" menu).
-  q('nav[data-aid="HEADER_NAV_RENDERED"]').forEach(function(n,i){
-    if(i===0){ q('.nav-item',n).forEach(function(it){ it.style.visibility='visible'; }); }
-    else { var cell=n.closest('[data-ux="GridCell"]')||n; cell.style.display='none'; }
-  });
-  // Open the navigation drawer (the hamburger shows only on narrow screens).
+  // Open the navigation drawer. The hamburger shows only on narrow screens;
+  // desktop links render with CSS (no JS needed).
   q('a[toggleId]').forEach(function(btn){
     btn.addEventListener('click', function(e){
       e.preventDefault();
@@ -88,19 +84,11 @@ const CUSTOM_JS = `
       if(d){ d.style.transform='translateX(0)'; d.style.visibility='visible'; }
     });
   });
-  // Close mobile navigation drawer
+  // Close the navigation drawer
   q('[data-close="true"]').forEach(function(el){
     el.addEventListener('click', function(){
       var d=el.closest('[data-ux="NavigationDrawer"]');
       if(d){ d.style.transform='translateX(-249vw)'; d.style.visibility='hidden'; }
-    });
-  });
-  // Toggle "More" dropdown menus
-  q('a[data-ux="NavLinkDropdown"]').forEach(function(btn){
-    btn.addEventListener('click', function(e){
-      e.preventDefault();
-      var menu=btn.parentNode.querySelector('ul[role="menu"]');
-      if(menu){ menu.style.display=(menu.style.display==='block'?'none':'block'); }
     });
   });
   // Static mirror: prevent dead form submissions from reloading the page
@@ -184,6 +172,79 @@ function removeBuilderArtifacts(html) {
       /<div id="[0-9a-f-]+" class="widget widget-cookie-banner[\s\S]*?<\/div><\/div>/,
       ''
     );
+  }
+  return html;
+}
+
+// ---- Item 1 helper: split CSS into top-level rules (brace-aware) ----
+function splitCssRules(css) {
+  const rules = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < css.length; i++) {
+    const ch = css[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        rules.push(css.slice(start, i + 1).trim());
+        start = i + 1;
+      }
+    }
+  }
+  return rules.filter(Boolean);
+}
+
+// (2) Make the desktop nav work without JS: drop visibility:hidden (c1-2m) from
+// the nav items, and delete the duplicate second nav group (the one with the
+// "More" overflow). The hamburger drawer still drives narrow screens.
+function customizeNav(html) {
+  html = html.replace(/class="([^"]*\bnav-item\b[^"]*)"/g, function (_, cls) {
+    return 'class="' + cls.replace(/\s*\bc1-2m\b/, '') + '"';
+  });
+  const tag = 'data-aid="HEADER_NAV_RENDERED"';
+  const first = html.indexOf(tag);
+  if (first !== -1) {
+    const second = html.indexOf(tag, first + tag.length);
+    if (second !== -1) {
+      const navStart = html.lastIndexOf('<nav', second);
+      const cellStart = html.lastIndexOf('<div data-ux="GridCell"', navStart);
+      const navEnd = html.indexOf('</nav>', navStart);
+      if (cellStart !== -1 && navEnd !== -1) {
+        const cellEnd = html.indexOf('</div>', navEnd) + '</div>'.length;
+        html = html.slice(0, cellStart) + html.slice(cellEnd);
+      }
+    }
+  }
+  return html;
+}
+
+// (3) Head cleanup: collapse duplicate touch icons, drop the obsolete IE meta,
+// trim trailing newlines in social titles, and make canonical/social URLs
+// absolute to the live site.
+function cleanHead(html) {
+  html = html.replace(/<link rel="apple-touch-icon"[^>]*>/g, '');
+  html = html.replace('</head>', '<link rel="apple-touch-icon" href="/assets/img/icon.jpg"/></head>');
+  html = html.replace(/<meta http-equiv="X-UA-Compatible"[^>]*>/g, '');
+  html = html.replace(/content="Embers to Ash\s+"/g, 'content="Embers to Ash"');
+  html = html.replace(/content="https:\/\/emberstoash\.com/g, 'content="' + SITE_URL);
+  html = html.replace(
+    /(<meta (?:property|name)="(?:og:image|twitter:image)" content=")\/assets\//g,
+    '$1' + SITE_URL + '/assets/'
+  );
+  return html;
+}
+
+// (4) Strip inert builder attributes that no longer do anything.
+function stripInertAttrs(html) {
+  html = html.replace(/\s+rel=""/g, '');
+  html = html.replace(/\s+target=""/g, '');
+  for (const a of [
+    'treatmentName', 'maxLines', 'headerTreatment', 'containerId',
+    'defaultFontSize', 'data-ht', 'data-toggle-ignore', 'data-stickynav',
+    'data-stickynav-wrapper', 'data-page',
+  ]) {
+    html = html.replace(new RegExp('\\s+' + a + '="[^"]*"', 'g'), '');
   }
   return html;
 }
@@ -292,7 +353,8 @@ async function main() {
     console.log('image ', name, got.buf.length + 'b');
   }
 
-  // 4) Rewrite + write each page.
+  // 4) Transform each page (styles stay inline here; consolidated in 4c).
+  const built = [];
   let welcomeProcessed = null;
   for (const p of pages) {
     let html = p.html;
@@ -306,15 +368,17 @@ async function main() {
       html = html.replace(re, local);
     }
 
-    // Apply the requested content corrections (footer on every page; the
-    // contact-form + hero changes apply to the home page only).
+    // Content corrections (footer everywhere; contact-form + hero are home-only).
     html = customizeFooter(html);
     html = customizeContact(html);
     if (p.home) html = customizeHero(html);
 
-    // Remove builder artifacts: cookie pop-up, empty/ad widgets, generator
-    // meta, and dead tracking attributes.
+    // Strip builder artifacts, then optimize: no-JS desktop nav, head cleanup,
+    // and removal of inert builder attributes.
     html = removeBuilderArtifacts(html);
+    html = customizeNav(html);
+    html = cleanHead(html);
+    html = stripInertAttrs(html);
 
     // Remove the builder's runtime scripts + service-worker registration.
     html = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
@@ -323,16 +387,12 @@ async function main() {
     // Inject our interactivity shim.
     html = html.replace('</body>', `<script>${CUSTOM_JS}</script></body>`);
 
-    if (forbidden.test(html)) console.warn('WARN: residual builder reference in', p.route + '.html');
+    built.push({ route: p.route, home: !!p.home, html });
     if (p.home) welcomeProcessed = html;
-
-    await writeFile(path.join(OUT, `${p.route}.html`), html, 'utf8');
-    if (p.home) await writeFile(path.join(OUT, 'index.html'), html, 'utf8');
-    console.log('wrote ', p.route + '.html' + (p.home ? ' (+ index.html)' : ''));
   }
 
-  // 4b) Privacy Policy page: reuse the welcome page's header + corrected
-  // footer, swapping the contact widget for the privacy content.
+  // 4b) Privacy Policy page: reuse the welcome page's header + corrected footer,
+  // swapping the contact widget for the privacy content.
   if (welcomeProcessed) {
     const cStart = welcomeProcessed.indexOf('<div id="9348b19c-e100-4b57-87f3-917139bec823"');
     const fStart = welcomeProcessed.indexOf('<div id="73419053-1186-44c0-948d-11d982a8b886"');
@@ -340,25 +400,68 @@ async function main() {
       let pp =
         welcomeProcessed.slice(0, cStart) + PRIVACY_CONTENT + welcomeProcessed.slice(fStart);
       pp = pp.replace('<title>Welcome</title>', '<title>Privacy Policy | Embers to Ash</title>');
-      if (forbidden.test(pp)) console.warn('WARN: residual builder reference in privacy-policy.html');
-      await writeFile(path.join(OUT, 'privacy-policy.html'), pp, 'utf8');
-      console.log('wrote  privacy-policy.html');
+      built.push({ route: 'privacy-policy', home: false, html: pp });
     } else {
       console.warn('WARN: could not locate content/footer anchors for privacy page');
     }
   }
 
+  // 4c) Item 1: consolidate every page's inline <style> into one cached
+  // /assets/site.css. Class names + fonts are identical across pages, so the
+  // union is safe; rules are de-duplicated and grouped by their original sheet.
+  const sheetOrder = [];
+  const sheets = new Map();
+  for (const b of built) {
+    const re = /<style([^>]*)>([\s\S]*?)<\/style>/g;
+    let m;
+    while ((m = re.exec(b.html))) {
+      const key = (m[1] || '').trim();
+      const css = (m[2] || '').replace(/\/\*[\s\S]*?\*\//g, '');
+      if (!sheets.has(key)) {
+        sheets.set(key, { seen: new Set(), rules: [] });
+        sheetOrder.push(key);
+      }
+      const g = sheets.get(key);
+      for (const r of splitCssRules(css)) {
+        if (!g.seen.has(r)) {
+          g.seen.add(r);
+          g.rules.push(r);
+        }
+      }
+    }
+  }
+  let siteCss =
+    '/* Embers to Ash - consolidated styles. Fonts: Dancing Script, Cantarell, Cinzel (SIL OFL). */\n';
+  for (const key of sheetOrder) siteCss += sheets.get(key).rules.join('') + '\n';
+  await writeFile(path.join(ASSET_DIR, 'site.css'), siteCss, 'utf8');
+  console.log('wrote  assets/site.css ' + Math.round(Buffer.byteLength(siteCss) / 1024) + 'KB');
+
+  // 4d) Replace each page's inline styles with a single cached stylesheet link.
+  for (const b of built) {
+    let html = b.html.replace(/<style[^>]*>[\s\S]*?<\/style>/g, '');
+    html = html.replace('</head>', '<link rel="stylesheet" href="/assets/site.css"/></head>');
+    if (forbidden.test(html)) console.warn('WARN: residual builder reference in', b.route + '.html');
+    await writeFile(path.join(OUT, `${b.route}.html`), html, 'utf8');
+    if (b.home) await writeFile(path.join(OUT, 'index.html'), html, 'utf8');
+    console.log('wrote ', b.route + '.html' + (b.home ? ' (+ index.html)' : ''));
+  }
+
   // 5) Aux files.
   const iconPath =
     [...imgMap.values()].find((v) => v.includes('/icon.')) || '/assets/img/icon.png';
+  const iconType = iconPath.endsWith('.png')
+    ? 'image/png'
+    : iconPath.endsWith('.webp')
+    ? 'image/webp'
+    : 'image/jpeg';
 
   const manifest = {
     scope: '/',
     start_url: '/',
     display: 'standalone',
     icons: [
-      { sizes: '192x192', type: 'image/png', src: iconPath },
-      { sizes: '512x512', type: 'image/png', src: iconPath },
+      { sizes: '192x192', type: iconType, src: iconPath },
+      { sizes: '512x512', type: iconType, src: iconPath },
     ],
     name: 'Embers to Ash',
     short_name: 'Embers to Ash',

@@ -5,12 +5,12 @@
   "icons": [
     {
       "sizes": "192x192",
-      "type": "image/png",
+      "type": "image/jpeg",
       "src": "/assets/img/icon.jpg"
     },
     {
       "sizes": "512x512",
-      "type": "image/png",
+      "type": "image/jpeg",
       "src": "/assets/img/icon.jpg"
     }
   ],
