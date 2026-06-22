@@ -4,8 +4,8 @@
 //
 // What it does:
 //   1. Fetches each page's server-rendered HTML.
-//   2. Downloads every referenced font and image from the source CDN once.
-//   3. Rewrites all CDN URLs to local /assets/... paths.
+//   2. Downloads every referenced font and image (host-agnostic) once.
+//   3. Rewrites those asset URLs to local /assets/... paths.
 //   4. Strips the builder's runtime JS + the service-worker registration.
 //   5. Optimizes builder cruft: consolidates inline CSS into one cached
 //      stylesheet, makes the desktop nav work without JS, and cleans the head.
@@ -15,7 +15,7 @@
 //
 // No third-party dependencies (uses Node 18+ global fetch).
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -68,6 +68,31 @@ function extOf(ct, fallback = 'jpg') {
 
 function reEsc(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ---- Asset helpers (provider-agnostic) --------------------------------------
+// Cap (px) for the responsive variant we download when a source image is
+// offered at several sizes.
+const MAX_IMG_WIDTH = 1600;
+
+// Largest width hint found in a URL (supports w:NNN, w=NNN, width=NNN).
+function widthHint(url) {
+  const nums = [...url.matchAll(/\bw(?:idth)?[:=](\d+)/gi)].map((m) => +m[1]);
+  return nums.length ? Math.max(...nums) : 0;
+}
+
+// Identity of a source image: drop a CDN transform suffix (the "/:/..."
+// convention) and any query string so responsive variants collapse to one file.
+function assetBase(url) {
+  return url.split('/:/')[0].split('?')[0];
+}
+
+// Readable local filename derived from the URL itself (no provider keywords).
+function assetName(base, ext) {
+  const seg = (base.split('/').filter(Boolean).pop() || '').replace(/[^a-zA-Z0-9._-]/g, '');
+  if (/\.[a-z0-9]+$/i.test(seg)) return seg; // already a filename.ext
+  const stem = /[a-zA-Z0-9]/.test(seg) ? seg : 'img';
+  return stem + '-' + createHash('sha1').update(base).digest('hex').slice(0, 8) + '.' + ext;
 }
 
 // ---- Minimal element helpers ------------------------------------------------
@@ -164,8 +189,9 @@ const CUSTOM_JS = `
 })();
 `.trim();
 
-// Quality gate: generated pages must not contain un-localized source CDN URLs.
-const forbidden = /wsimg\.com/i;
+// Quality gate (provider-agnostic): no remote asset URL should survive
+// localization inside CSS url(), <img>/<source> src, or srcset.
+const remoteAsset = /(?:url\(\s*["']?|\bsrc="\s*|\bsrcset="\s*)(?:https?:)?\/\//i;
 
 // ---- Requested content corrections ------------------------------------------
 
@@ -210,6 +236,43 @@ function customizeHero(html) {
   // remove the now-duplicate sub-tagline line
   html = html.replace(/<div data-ux="SubTagline"[\s\S]*?<\/div>/, '');
   return html;
+}
+
+// Promote JS-lazy images to static <img>: the real source lives in
+// data-srclazy / data-srcsetlazy (already localized) while src is a base64
+// placeholder. Move the real source into src/srcSet and clear the off-screen
+// transform the builder used to hide it, so the photo renders without script.
+function delazify(html) {
+  html = html.replace(/<(?:img|source)\b[^>]*>/gi, (tag) => {
+    const real = tag.match(/\sdata-srclazy="([^"]*)"/i);
+    const realSet = tag.match(/\sdata-srcsetlazy="([^"]*)"/i);
+    if (!real && !realSet) return tag;
+    let out = tag;
+    if (real) {
+      out = /\ssrc="/i.test(out)
+        ? out.replace(/\ssrc="[^"]*"/i, ' src="' + real[1] + '"')
+        : out.replace(/<(img|source)\b/i, '<$1 src="' + real[1] + '"');
+    }
+    if (realSet) {
+      out = /\ssrcset="/i.test(out)
+        ? out.replace(/\ssrcset="[^"]*"/i, ' srcset="' + realSet[1] + '"')
+        : out.replace(/<(img|source)\b/i, '<$1 srcset="' + realSet[1] + '"');
+    } else if (real) {
+      // no real srcset: drop the placeholder srcset/sizes so the real src wins
+      out = out.replace(/\ssrcset="[^"]*"/i, '').replace(/\ssizes="[^"]*"/i, '');
+    }
+    if (/<img\b/i.test(out) && !/\sstyle="/i.test(out)) {
+      out = out.replace(/<img\b/i, '<img style="transform:none"'); // override off-screen transform
+    }
+    return out;
+  });
+  // lazy <picture> wrappers are parked off-screen via a transform until the
+  // builder's JS reveals them; neutralize that so the static image shows.
+  html = html.replace(/<picture\b[^>]*>/gi, (tag) =>
+    /\sstyle="/i.test(tag) ? tag : tag.replace(/<picture\b/i, '<picture style="transform:none"')
+  );
+  // strip any residual lazy hooks (e.g., on the <picture> wrapper)
+  return html.replace(/\sdata-(?:srclazy|srcsetlazy|lazyimg)="[^"]*"/gi, '');
 }
 
 // (1, 4, 5) Strip builder-specific artifacts and dead markup: the cookie
@@ -278,11 +341,18 @@ function customizeNav(html) {
 // trim trailing newlines in social titles, and make canonical/social URLs
 // absolute to the live site.
 function cleanHead(html) {
-  html = html.replace(/<link rel="apple-touch-icon"[^>]*>/g, '');
-  html = html.replace('</head>', '<link rel="apple-touch-icon" href="/assets/img/icon.jpg"/></head>');
+  // dedupe touch icons: keep the first (with its localized href), drop the rest
+  let keptIcon = false;
+  html = html.replace(/<link rel="apple-touch-icon"[^>]*>/g, (m) => {
+    if (keptIcon) return '';
+    keptIcon = true;
+    return m;
+  });
   html = html.replace(/<meta http-equiv="X-UA-Compatible"[^>]*>/g, '');
   html = html.replace(/content="Embers to Ash\s+"/g, 'content="Embers to Ash"');
-  html = html.replace(/content="https:\/\/emberstoash\.com/g, 'content="' + SITE_URL);
+  // point the source site's canonical/social URL at the deployed copy
+  html = html.replace(new RegExp('content="' + reEsc(ORIGIN), 'g'), 'content="' + SITE_URL);
+  // make localized social images absolute
   html = html.replace(
     /(<meta (?:property|name)="(?:og:image|twitter:image)" content=")\/assets\//g,
     '$1' + SITE_URL + '/assets/'
@@ -353,6 +423,7 @@ const PRIVACY_CONTENT =
   '</div></div></section></div></div></div>';
 
 async function main() {
+  await rm(ASSET_DIR, { recursive: true, force: true }); // start clean (no orphan assets)
   await mkdir(FONT_DIR, { recursive: true });
   await mkdir(IMG_DIR, { recursive: true });
 
@@ -365,44 +436,59 @@ async function main() {
   }
   const allHtml = pages.map((p) => p.html).join('\n');
 
-  // 2) Fonts (one file per unique URL).
+  // 2) Fonts: any absolute web-font URL, regardless of host.
   const fontUrls = new Set(
-    allHtml.match(/https:\/\/img1\.wsimg\.com\/gfonts\/[^\s"')]+\.woff2/g) || []
+    allHtml.match(/(?:https?:)?\/\/[^\s"')]+\.(?:woff2?|ttf|otf|eot)\b/gi) || []
   );
   const fontMap = new Map();
   for (const u of fontUrls) {
     const name = u.split('/').pop().split('?')[0];
-    const { buf } = await fetchBuf(u);
+    const { buf } = await fetchBuf(u.startsWith('http') ? u : 'https:' + u);
     await writeFile(path.join(FONT_DIR, name), buf);
     fontMap.set(u, `/assets/fonts/${name}`);
     console.log('font  ', name, buf.length + 'b');
   }
 
-  // 3) Images (collapse every transform variant of a base path to one file).
-  const imgUrls = new Set(
-    allHtml.match(/(?:https:)?\/\/(?:img1|isteam)\.wsimg\.com\/isteam\/[^\s"')]+/g) || []
-  );
-  const baseSet = new Set();
-  for (const u of imgUrls) baseSet.add(u.split('/:/')[0]);
+  // 3) Images: collect every remote image URL from the contexts where assets
+  // appear (CSS url(), <img>/<source>, icon links, social meta), group the
+  // responsive variants of each source image, and download one local copy.
+  const imgUrls = new Set();
+  for (const m of allHtml.matchAll(/url\(\s*["']?((?:https?:)?\/\/[^"')\s]+)["']?\s*\)/gi)) imgUrls.add(m[1]);
+  // Any remote URL token inside an <img>/<source> tag - covers src, srcset and
+  // the builder's lazy-load attributes (data-srclazy / data-srcsetlazy).
+  for (const tag of allHtml.matchAll(/<(?:img|source)\b[^>]*>/gi)) {
+    for (const u of tag[0].matchAll(/(?:https?:)?\/\/[^\s"]+/g)) imgUrls.add(u[0]);
+  }
+  for (const m of allHtml.matchAll(/<link\b[^>]*\bhref="((?:https?:)?\/\/[^"]+)"[^>]*>/gi)) {
+    if (/rel="[^"]*icon[^"]*"/i.test(m[0]) || /\bas="image"/i.test(m[0])) imgUrls.add(m[1]);
+  }
+  for (const m of allHtml.matchAll(/<meta\b[^>]*(?:property|name)="(?:og:image|twitter:image)"[^>]*\bcontent="((?:https?:)?\/\/[^"]+)"/gi)) imgUrls.add(m[1]);
+  for (const u of [...imgUrls]) if (/\.(?:woff2?|ttf|otf|eot)\b/i.test(u)) imgUrls.delete(u);
+
+  // group variants by source-image base
+  const variantsByBase = new Map();
+  for (const u of imgUrls) {
+    const base = assetBase(u);
+    if (!variantsByBase.has(base)) variantsByBase.set(base, []);
+    variantsByBase.get(base).push(u);
+  }
 
   const imgMap = new Map(); // protocol-relative base -> local public path
-  for (const baseRaw of baseSet) {
-    const base = baseRaw.startsWith('http') ? baseRaw : 'https:' + baseRaw;
-    let got;
-    try {
-      got = await fetchBuf(base + '/:/rs=w:1600'); // request a high-res render
-    } catch {
-      got = await fetchBuf(base);
+  for (const [base, variants] of variantsByBase) {
+    // prefer the largest offered variant within MAX_IMG_WIDTH; else the base
+    let rep = base;
+    let best = -1;
+    for (const v of variants) {
+      const w = widthHint(v);
+      if (w > best && w <= MAX_IMG_WIDTH) { best = w; rep = v; }
     }
-    const ext = extOf(got.ct);
-    let name;
-    const m = base.match(/getty\/(\d+)/);
-    if (m) name = `getty-${m[1]}.${ext}`;
-    else if (base.includes('logo-default')) name = `icon.${ext}`;
-    else if (base.includes('transparent_placeholder')) name = `placeholder.${ext}`;
-    else name = `img-${createHash('sha1').update(base).digest('hex').slice(0, 10)}.${ext}`;
+    const toAbs = (u) => (u.startsWith('http') ? u : 'https:' + u);
+    let got;
+    try { got = await fetchBuf(toAbs(rep)); }
+    catch { got = await fetchBuf(toAbs(base)); }
+    const name = assetName(base, extOf(got.ct));
     await writeFile(path.join(IMG_DIR, name), got.buf);
-    imgMap.set(baseRaw.replace(/^https:/, ''), `/assets/img/${name}`);
+    imgMap.set(base.replace(/^https?:/, ''), `/assets/img/${name}`);
     console.log('image ', name, got.buf.length + 'b');
   }
 
@@ -415,11 +501,13 @@ async function main() {
     // Localize fonts.
     for (const [u, local] of fontMap) html = html.split(u).join(local);
 
-    // Localize images: base + optional /:/transform, with or without https:
+    // Localize images: a source base plus any transform/query variant.
     for (const [baseRel, local] of imgMap) {
-      const re = new RegExp('(?:https:)?' + reEsc(baseRel) + "(?:/:/[^\\s\"')]*)?", 'g');
+      const re = new RegExp('(?:https?:)?' + reEsc(baseRel) + "(?:/:/[^\\s\"')]*)?(?:\\?[^\\s\"')]*)?", 'g');
       html = html.replace(re, local);
     }
+    // Promote JS-lazy images to static <img> so photos render without script.
+    html = delazify(html);
 
     // Content corrections (footer everywhere; contact-form + hero are home-only).
     html = customizeFooter(html);
@@ -485,6 +573,7 @@ async function main() {
   let siteCss =
     '/* Embers to Ash - consolidated styles. Fonts: Dancing Script, Cantarell, Cinzel (SIL OFL). */\n';
   for (const key of sheetOrder) siteCss += sheets.get(key).rules.join('') + '\n';
+  if (remoteAsset.test(siteCss)) console.warn('WARN: un-localized remote asset in site.css');
   await writeFile(path.join(ASSET_DIR, 'site.css'), siteCss, 'utf8');
   console.log('wrote  assets/site.css ' + Math.round(Buffer.byteLength(siteCss) / 1024) + 'KB');
 
@@ -493,15 +582,15 @@ async function main() {
     let html = unwrapWidgets(b.html);
     html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/g, '');
     html = html.replace('</head>', '<link rel="stylesheet" href="/assets/site.css"/></head>');
-    if (forbidden.test(html)) console.warn('WARN: residual builder reference in', b.route + '.html');
+    if (remoteAsset.test(html)) console.warn('WARN: un-localized remote asset in', b.route + '.html');
     await writeFile(path.join(OUT, `${b.route}.html`), html, 'utf8');
     if (b.home) await writeFile(path.join(OUT, 'index.html'), html, 'utf8');
     console.log('wrote ', b.route + '.html' + (b.home ? ' (+ index.html)' : ''));
   }
 
-  // 5) Aux files.
-  const iconPath =
-    [...imgMap.values()].find((v) => v.includes('/icon.')) || '/assets/img/icon.png';
+  // 5) Aux files. Derive the PWA icon from the (localized) touch-icon link.
+  const iconMatch = (welcomeProcessed || '').match(/<link rel="apple-touch-icon"[^>]*href="([^"]+)"/);
+  const iconPath = iconMatch ? iconMatch[1] : ([...imgMap.values()][0] || '/assets/img/icon.png');
   const iconType = iconPath.endsWith('.png')
     ? 'image/png'
     : iconPath.endsWith('.webp')
